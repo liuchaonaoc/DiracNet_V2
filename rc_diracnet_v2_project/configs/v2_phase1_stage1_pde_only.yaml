@@ -1,0 +1,8 @@
+defaults: default.yaml
+
+
+stage1:
+  n_epochs: 1000
+
+stage2:
+  enabled: false

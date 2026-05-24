@@ -1,0 +1,18 @@
+# ADR-027 baseline (shape weight=5.0, MLP) on hydrogenic Z=1..8 (O).
+# Extends the validated 12-row H/He/Li set to 48 rows (8 elements × 6 n-levels).
+defaults: default.yaml
+
+kan:
+  kind: mlp
+
+stage1:
+  n_epochs: 1000
+  gate:
+    test_manifest: data_cache/manifest_hydrogenic_z8.parquet
+
+dataset:
+  manifest: data_cache/manifest_hydrogenic_z8.parquet
+
+training:
+  ckpt_dir: ./checkpoints/v2_adr027_z8_o
+  log_dir: ./logs/v2_adr027_z8_o

@@ -1,0 +1,9 @@
+defaults: ablation_pykan.yaml
+
+stage1:
+  n_epochs: 3
+scheduler:
+  total_steps: 9
+training:
+  ckpt_dir: ./checkpoints/v2_ablation_pykan_smoke
+  log_dir: ./logs/v2_ablation_pykan_smoke

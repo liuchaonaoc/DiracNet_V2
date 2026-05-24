@@ -185,7 +185,31 @@ def test_pde_loss_h1s_analytic():
     ...
 ```
 
-### 2.9 `test_v2_per_orb_features.py`
+### 2.9 `test_v2_action_loss.py`
+
+```python
+def test_action_loss_hydrogenic_quantization():
+    """Coulomb analytic energy should satisfy Bohr-Sommerfeld quantisation."""
+    grid = RadialGrid(r_min=1e-4, r_max=50.0, n_grid=512, scheme="loglinear")
+    Z = torch.tensor([1])
+    V_eff = -Z.float().view(1, 1) / grid.r.view(1, -1)
+    E_orb = torch.tensor([[-0.5]])       # H 1s
+    n_idx = torch.tensor([[1]])
+    l_idx = torch.tensor([[0]])
+    mask = torch.tensor([[True]])
+    L = BohrSommerfeldActionLoss()(E_orb, V_eff, n_idx, l_idx, mask, grid)
+    assert L < 1e-3
+
+def test_action_loss_wrong_n_penalty():
+    """H 1s energy with n=2 target should be penalised."""
+    ...
+
+def test_action_loss_grad_finite():
+    """Loss backward through E_orb is finite near allowed-region boundaries."""
+    ...
+```
+
+### 2.10 `test_v2_per_orb_features.py`
 
 ```python
 def test_per_orb_features_h1s():
@@ -277,18 +301,51 @@ def test_stage2_rollback():
     ...
 ```
 
+### 3.5 `test_v2_residual_safety.py`
+
+```python
+def test_residual_safety_flags_large_delta():
+    """Δ_residual 接近 cap 且主要负责降误差时，calibrated 结果不能 ACCEPT。"""
+    metrics = {
+        "e_orb_only_mae_mev": 100.0,
+        "calibrated_mae_mev": 5.0,
+        "delta_abs_max_mev": 4.9,
+        "delta_cap_mev": 5.0,
+        "delta_ratio_median": 0.8,
+        "loo_rms_mev": 500.0,
+        "physics_gate_pass": True,
+    }
+    verdict = residual_safety_verdict(metrics)
+    assert verdict == "CHEATING_RISK"
+
+def test_residual_safety_accepts_small_calibration():
+    """E_orb-only 已经好，Δ_residual 小幅改善且 OOD 通过时才 ACCEPT。"""
+    metrics = {
+        "e_orb_only_mae_mev": 20.0,
+        "calibrated_mae_mev": 12.0,
+        "delta_abs_max_mev": 1.5,
+        "delta_cap_mev": 5.0,
+        "delta_ratio_median": 0.1,
+        "loo_rms_mev": 80.0,
+        "physics_gate_pass": True,
+    }
+    verdict = residual_safety_verdict(metrics)
+    assert verdict == "ACCEPT_CALIBRATION"
+```
+
 ## 4. L3 端到端测试
 
 ### 4.1 `test_v2_full_smoke.py`
 
 ```python
 def test_e2e_smoke():
-    """3 epoch Stage 1 + 2 epoch Stage 2，5 行数据
+    """3 epoch Stage 1 + optional 2 epoch Stage 2 calibration，5 行数据
     
     不要求性能；只要：
         - 全程不 NaN
         - 训练完成 checkpoint 写盘
         - evaluator 运行成功
+        - evaluator 同时输出 E_orb-only 与 calibrated 字段
     """
     ...
 ```
@@ -323,6 +380,8 @@ def test_phase1_stage1_passes_gate():
 - 在 trainer 中每个 epoch 调用；
 - 写入 `logs/v2_*/gate.csv` 时间序列；
 - 触发 stage 切换 / rollback。
+- gate 必须包含 `L_action_BS` 或等价的 action error 字段；
+- Stage 2 后必须同时检查 residual safety。
 
 ## 6. CI 集成
 
@@ -382,8 +441,8 @@ def hydrogenic_h_1s_batch():
 ## 8. 测试数量目标
 
 - **Sprint 1 完成**：≥ 12 单元测试 (B-spline 4 + envelope 3 + readout 4 + per_orb 1)
-- **Sprint 2 完成**：≥ 20 单元 + 2 集成
-- **Sprint 3 完成**：≥ 30 单元 + 4 集成 + 1 端到端
-- **Sprint 4 完成**：≥ 35 单元 + 5 集成 + 2 端到端
+- **Sprint 2 完成**：≥ 23 单元 + 2 集成（新增 action loss 测试）
+- **Sprint 3 完成**：≥ 34 单元 + 5 集成 + 1 端到端（新增 residual safety）
+- **Sprint 4 完成**：≥ 39 单元 + 6 集成 + 2 端到端
 
 任何 Sprint 验收时测试数下滑 = 视为未通过验收。

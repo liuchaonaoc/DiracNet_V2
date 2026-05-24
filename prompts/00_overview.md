@@ -18,7 +18,7 @@ V1 在 Phase 1（类氢沙盒）上拿到 170 meV MAE，但 **Phase-A 解析诊�
 - RC `tanh` 基底无法张成 Laguerre L_{n-1}^1(2λr)，所以 `n ≥ 3` 的形状余弦 < 0.1；
 - Löwdin 归一化 + 有界 `Δ_term (≤0.1 Ha)` 联手吃掉数百 meV 的能量误差。
 
-## 2. V2 的三条核心立场
+## 2. V2 的四条核心立场
 
 ### 2.1 假设类 (hypothesis class) 必须 **结构性包含真解**
 
@@ -47,12 +47,14 @@ V1 的 R9 同时让 `PDE (w=0.01)` 与 `NIST (w=10)` 进入梯度。后者占绝
 V2 的严格做法：
 
 ```
-Stage 1:  loss = w_pde · L_PDE + w_ortho · L_ortho + w_node · L_node + w_asym · L_asym
+Stage 1:  loss = w_pde · L_PDE + w_ortho · L_ortho + w_node · L_node
+                + w_asym · L_asym + w_action · L_action_BS
           # NIST 只在 metric log 里出现，不连 backward
+          # L_action_BS 是 Bohr-Sommerfeld 作用量量子化约束，用于防 n-collapse
           
-Stage 2:  loss = w_pde · L_PDE + w_nist · L_NIST_residual
-          # 主网络 (λ-MLP, c-KAN) 冻结或 lr <= 1e-6
-          # 只让 Δ_residual head（强约束 ±50 meV）学习
+Stage 2:  可选 calibration，不是主结果
+          主报告必须先给 E_orb-only；Δ_residual 只能作为受限残差实验
+          # 主网络 (λ, c-KAN) 冻结；Δ_residual 有严格幅度、占比、OOD 门禁
 ```
 
 ### 2.3 评估必须 **比对解析解 / 跨数据集泛化**
@@ -64,6 +66,31 @@ Stage 1 完成后必须执行三项硬门禁：
 3. **能量一致性**：`|E_orb_model - (-Z²/2n²)| < 1 meV`。
 
 任意一项不过，不许进入 Stage 2。
+
+### 2.4 `E_orb-only` 是主结果，`Δ_residual` 只是受限校准
+
+V2 默认主基准是：
+
+```
+E_pred_main = Σ_a occ_a · E_orb_a
+```
+
+`Δ_residual` **不属于主物理模型**，只能作为 Stage 2 calibration experiment：
+
+```
+E_pred_calibrated = E_pred_main + Δ_residual
+```
+
+报告任何 calibrated 指标时，必须同时报告：
+
+- `E_orb-only` 的 raw/aligned MAE/RMS；
+- `E_orb + Δ_residual` 的 raw/aligned MAE/RMS；
+- `max |Δ_residual|` 与 `median |Δ_residual|`；
+- `|Δ_residual| / |E_orb - E_target|` 的占比；
+- leave-one-n / leave-one-Z / leave-one-ion 的 OOD 结果；
+- Stage 2 后的 `|cos|`, `λ drift`, `L_PDE`, `L_action_BS` 门禁。
+
+如果 `Δ_residual` 改善能量但 `E_orb-only` 仍错、波函数门禁退化，结果判为 cheating。
 
 ## 3. 为什么是 B-spline，不是别的
 
@@ -115,9 +142,23 @@ KAN 不是必需的——如果工程觉得 KAN 不稳定，**保留备选**：�
 | Finding 3: 联合优化的几何退化 | KAN 接受 (Z, n, l) 显式输入，不再依赖联合 MLP 自己分辨 |
 | Recommendation 1: 永远先跑解析对照 | 写入 `07_evaluation.md` 的 Stage 1 验收门禁 |
 | Recommendation 2: 加 Z=4..10 数据破除退化 | 在 `08_data_pipeline.md` 中写入 Phase 1+ manifest |
-| Recommendation 3: 不再用 `zn_bias_table` | Stage 2 用 `Δ_residual(h_cond, J, π, term)`，不分 (Z, n) lookup |
+| Recommendation 3: 不再用 `zn_bias_table` | V2 主结果只看 `E_orb-only`；`Δ_residual` 仅作为受限校准实验，不能当主结果 |
 | Recommendation 4: 默认 polynomial / 替换 RC | 直接弃用 RC，仅 B-spline |
 | Recommendation 5: 高 n 用 Laguerre | B-spline + 节点对数分布等价的覆盖能力 |
+
+## 6.1 与 MIT 作用量论文的取舍
+
+MIT 2026 的 *On computing quantum waves exactly from classical action* 说明可以从 classical action + density
+严格重构 Schrödinger 波。在 V2 的**束缚定态径向问题**中，完整 Hamilton-Jacobi + density 框架会退化成
+与 Schrödinger/Dirac PDE 等价的局部条件，因此不应把“作用量本身”重复加入 loss。
+
+V2 只吸收其中对本任务有新增信息的一部分：**Bohr-Sommerfeld 作用量量子化**
+
+```
+∫_{r_-}^{r_+} p_r(r) dr = π · (n - l - 1/2)
+```
+
+它是全局、可微、携带整数 n 信息的 scalar constraint，可与 `L_node` 一起防止 PDE-only 阶段的 n-collapse。
 
 ## 7. 不在 V2 第一版考虑的事项
 
@@ -128,5 +169,6 @@ KAN 不是必需的——如果工程觉得 KAN 不稳定，**保留备选**：�
 - DKB (Dual Kinetic Balance) 高 Z 修正
 - Breit / QED 残差
 - 周期 / 分子拓展
+- 时间含 Hamilton-Jacobi + density 多路径传播（MIT 论文完整威力，留到 V3 的光跃迁 / 隧穿 / continuum）
 
 V2 的目标：**在原子谱学的单粒子任务上，把假设类、训练动力学、评估门禁三件事一次性做对。**

@@ -93,7 +93,7 @@ find rc_diracnet_v2 -name "*.py" -exec \
 | `rc_diracnet/reservoir/envelope.py` (含 λ-MLP) | `rc_diracnet_v2/readout/envelope.py` (纯解析) | λ 改外部输入 |
 | `rc_diracnet/readout/wavefunction_readout.py` (含 W-MLP) | `rc_diracnet_v2/readout/bspline_readout.py` (无参) | 系数改外部输入 |
 | `rc_diracnet/models/rc_diracnet_levelwise.py` | `rc_diracnet_v2/models/dirac_net_v2.py` | 主架构改 |
-| `rc_diracnet/models/level_energy_head.py` (含 Δ_term + zn_bias) | `rc_diracnet_v2/models/level_residual_head.py` (Δ_res, bounded 50 meV) | Δ_term cap 显著缩小且仅 Stage 2 启用 |
+| `rc_diracnet/models/level_energy_head.py` (含 Δ_term + zn_bias) | `rc_diracnet_v2/models/level_residual_head.py` (optional Δ_res calibration) | 默认不启用；Phase 1 cap 1-5 meV，light atoms cap 20 meV；禁止 lookup |
 | `rc_diracnet/training/levelwise_trainer.py` | `rc_diracnet_v2/training/two_stage_trainer.py` | 协议改两阶段 |
 
 ## 4. **不复制** 的模块

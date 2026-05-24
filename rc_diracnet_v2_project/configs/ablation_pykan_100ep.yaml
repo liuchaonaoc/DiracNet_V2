@@ -1,0 +1,9 @@
+# Quick A/B vs ADR-027 MLP — same weights/losses, pyKAN backend, 100 epochs.
+defaults: ablation_pykan.yaml
+
+stage1:
+  n_epochs: 500
+
+training:
+  ckpt_dir: ./checkpoints/v2_ablation_pykan_100ep
+  log_dir: ./logs/v2_ablation_pykan_100ep

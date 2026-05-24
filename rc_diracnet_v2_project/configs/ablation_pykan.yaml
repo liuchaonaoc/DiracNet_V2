@@ -1,0 +1,11 @@
+# ADR-027 baseline + pyKAN backend for λ/c coefficient net (ablation).
+# Only delta vs default.yaml: kan.kind, checkpoint/log paths.
+defaults: default.yaml
+
+kan:
+  kind: pykan
+  # grid_size / spline_order passed to pykan MultKAN trunk (see pykan_coeff_net.py)
+
+training:
+  ckpt_dir: ./checkpoints/v2_ablation_pykan
+  log_dir: ./logs/v2_ablation_pykan

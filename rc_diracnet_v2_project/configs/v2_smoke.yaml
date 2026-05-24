@@ -1,0 +1,17 @@
+defaults: default.yaml
+
+stage1:
+  n_epochs: 3
+  warmup:
+    shape_pretrain_epochs: 2
+stage2:
+  enabled: true
+  n_epochs: 2
+  warmup_epochs: 1
+scheduler:
+  warmup_steps: 2
+  total_steps: 9
+training:
+  ckpt_dir: ./checkpoints/v2_smoke
+  log_dir: ./logs/v2_smoke
+

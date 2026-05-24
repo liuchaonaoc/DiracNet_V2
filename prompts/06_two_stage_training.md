@@ -7,26 +7,50 @@
 把 V1 retrospective 中描述的 **"NIST 与 PDE 同步训练 → cheating"** 问题
 **结构性消除**。具体做法：
 
-1. **Stage 1**: 完全没有 NIST 梯度。波函数与单粒子能级只通过物理约束（PDE + 正交 + 节点 + 渐近）训练。
+1. **Stage 1**: 完全没有 NIST 梯度。波函数与单粒子能级只通过物理约束（PDE + 正交 + 节点 + 作用量量子化 + 渐近）训练。
    NIST 仅作为评估指标记录在 log 中。
-2. **Stage 2**: 在 Stage 1 通过解析对照门禁后，启用一个 **窄带 Δ_residual head**（强约束 ±50 meV）
-   + 主网络冻结或低 lr，让 NIST 残差只能通过这个 head 学习。
+2. **Stage 2**: 在 Stage 1 通过解析对照门禁后，**可选**启用一个窄带 `Δ_residual head` 做 calibration。
+   这不是 V2 主结果；主结果始终是 `E_orb-only`。
 3. **门禁回滚**: Stage 2 中每个 epoch 复跑解析对照；若 `|cos|` 跌破 0.99，回滚到最近一个通过门禁的 ckpt。
+4. **反 residual-cheating**: 任何 calibrated 指标必须同时报告 `E_orb-only` 指标、残差幅度、残差占比和 LOO/OOD 结果。
 
 ## 2. Stage 1 — PDE-only 训练
 
 ### 2.1 训练目标
 
 ```
-L_stage1 = w_pde   · L_PDE
-         + w_ortho · L_ortho
-         + w_node  · L_node
-         + w_asym  · L_asym
-         + w_smooth · L_smooth
+L_stage1 = w_pde         · L_PDE          (per-sample normalised; see §15)
+         + w_ortho       · L_ortho
+         + w_node        · L_node
+         + w_action      · L_action_BS    (warmup; see §15)
+         + w_decay       · L_decay_consistency   (per-sample normalised)
+         + w_virial      · L_virial                (per-sample normalised)
+         + w_lambda_prior· L_lambda_prior  (curriculum-boosted on stage transitions)
+         + w_lobe_ratio  · L_lobe_ratio
+         + w_shape       · L_shape
+         + w_asym        · L_asym
+         + w_smooth      · L_smooth
+         + w_factor_amp  · L_factor_amp
+         + w_c_norm      · L_c_norm
 ```
+
+`L_node_pos / L_node_cross / L_sign` 在新方案中权重为 0（仅作 monitor），见 §05 §13、§15。
 
 NIST **不** 在 `L_stage1` 里。仍然每个 batch 计算 `L_NIST_monitor` 写日志，但
 **绝对不接梯度**（实现上 `with torch.no_grad():` 包住 NIST 计算分支）。
+
+#### Stage 1 子阶段（Curriculum，详见 §15 §2.3）
+
+```
+Stage 1a:  epoch ∈ [0, 0.20·N],   curriculum n_max = 1   (只训 n=1)
+Stage 1b:  epoch ∈ [0.20·N, 0.45·N], n_max = 2
+Stage 1c:  epoch ∈ [0.45·N, 0.75·N], n_max = 3
+Stage 1d:  epoch ∈ [0.75·N, N],   n_max = 4
+```
+
+实现：`_curriculum_mask(batch, epoch, n_epochs) → bool[B, N_orb]` 与原 `orb_mask` 按位 AND
+后传入所有需要 mask 的 loss。课程过渡瞬间 `λ_prior` 权重临时 ×2，
+持续到下一子阶段 1/3 时间逐步衰减回基线。
 
 ### 2.2 优化器与学习率
 
@@ -52,6 +76,7 @@ def train_stage1(model, train_loader, val_loader, n_epochs, cfg):
         "pde": DiracPDELoss(),
         "ortho": OrthonormalityLoss(),
         "node": NodeCountLoss(),
+        "action": BohrSommerfeldActionLoss(),
         "asym": AsymptoticTailLoss(),
         "smooth": BSplineSmoothLoss(),
     }
@@ -71,12 +96,14 @@ def train_stage1(model, train_loader, val_loader, n_epochs, cfg):
             l_pde   = losses["pde"](...)
             l_ortho = losses["ortho"](...)
             l_node  = losses["node"](...)
+            l_action = losses["action"](...)
             l_asym  = losses["asym"](...)
             l_smooth= losses["smooth"](out["c_raw"], batch["orb_mask"])
             
             L = (weights["pde"]   * l_pde
                + weights["ortho"] * l_ortho
                + weights["node"]  * l_node
+               + weights["action"]* l_action
                + weights["asym"]  * l_asym
                + weights["smooth"]* l_smooth)
             
@@ -97,6 +124,7 @@ def train_stage1(model, train_loader, val_loader, n_epochs, cfg):
                 "L_PDE": l_pde.item(),
                 "L_ortho": l_ortho.item(),
                 "L_node": l_node.item(),
+                "L_action_BS": l_action.item(),
                 "L_asym": l_asym.item(),
                 "L_smooth": l_smooth.item(),
                 "L_NIST_monitor": l_nist_mon.item(),
@@ -113,6 +141,22 @@ def train_stage1(model, train_loader, val_loader, n_epochs, cfg):
     print("[Stage 1] reached n_epochs without passing gate.")
 ```
 
+### 2.3.5 Stage 1 子阶段过渡门禁（新增 §15）
+
+每次 curriculum 切换（1a→1b, 1b→1c, 1c→1d）前必须满足下列**当前活跃 n 上**的条件：
+
+```yaml
+stage1.curriculum.transition_check:
+  cos_threshold: 0.99          # |cos(P_pred, P_an)| in (Z, n_active) > 0.99
+  lambda_rel_threshold: 0.05   # |λ_pred − Z/n| / (Z/n) < 5%
+  pde_drop_ratio: 10.0         # 子阶段末 5 epoch PDE 平均 < 子阶段起 5 epoch / 10
+  max_extension_ratio: 0.5     # 子阶段最长可延长 50%
+```
+
+任意一项不满足 → 当前子阶段 epoch 数自动延长（最长 50%），再检测；
+延长后仍不达标 → 触发 fallback：把 `lambda_prior` 权重再 ×1.5，再延长一次（最长 30% 额外）；
+仍不达标 → log warning 但放行进入下一子阶段（避免无限挂起）。
+
 ### 2.4 Stage 1 通过条件（门禁）
 
 定义在 `cfg.stage1.gate`：
@@ -126,6 +170,7 @@ stage1:
     L_PDE_threshold: 1.0e-3
     L_ortho_threshold: 1.0e-4
     L_node_threshold: 1.0e-2
+    L_action_BS_threshold: 1.0e-3
     test_set: data_cache/manifest_hydrogenic_v2.parquet   # H/He+/Li2+ 1s..5s
 ```
 
@@ -155,11 +200,15 @@ def check_stage1_gate(model, test_loader, thresholds) -> bool:
 |------|----------|------|
 | `L_PDE` 不下降 | KAN init 异常 / `c_0` 没置零 | 检查初始化、强制 c_0=0、降低 lr |
 | `L_PDE` 下降但 `|cos|` 卡在 0.9 | KAN 过拟合到错形状 / B-spline 节点不够 | `K: 32 → 48`；增加 `L_smooth` |
-| n=2 一直坍缩到 n=1 形状 | `L_node` 权重不够 / λ 没拉开 | `w_node: 0.1 → 1.0`；强制 λ_n = Z/n（freeze） |
+| n=2 一直坍缩到 n=1 形状 | `L_node` / `L_action_BS` 权重不够，或 λ 没拉开 | `w_node: 0.1 → 1.0`；`w_action: 0.05 → 0.1`；强制 λ_n = Z/n（freeze） |
 | `λ` 跑飞 | `lam_log_res` clamp 没生效 | 检查 clamp(-2, 2) 是否运行 |
+| `L_PDE` 低但 `L_action_BS` 高 | 收敛到错误 n 的局部本征解 | 检查 `n_idx/l_idx`、Maslov 修正、提高 action 权重 |
 | 远端 P 不衰减 | B-spline 节点没到 r_max / `L_asym` 不够 | 增加节点、提高 r_max、`w_asym: 0.01 → 0.1` |
 
-## 3. Stage 2 — NIST Residual Fine-Tune
+## 3. Stage 2 — Optional NIST Residual Calibration
+
+> Stage 2 是 **calibration experiment**，不是 V2 的主能力。任何论文 / 报告必须把
+> `E_orb-only` 指标放在 `E_orb + Δ_residual` 指标之前。只报告 calibrated 数字视为无效。
 
 ### 3.1 训练目标
 
@@ -167,9 +216,10 @@ def check_stage1_gate(model, test_loader, thresholds) -> bool:
 L_stage2 = w_pde       · L_PDE              (保持物理压力，防滑回)
          + w_ortho     · L_ortho
          + w_node      · L_node
+         + w_action    · L_action_BS
          + w_asym      · L_asym
          + w_smooth    · L_smooth
-         + w_nist(t)   · L_NIST_res
+         + w_nist(t)   · L_NIST_res         (可选；默认 calibration-only)
 ```
 
 `w_nist(t)` 是 ramp：
@@ -177,10 +227,10 @@ L_stage2 = w_pde       · L_PDE              (保持物理压力，防滑回)
 ```
 w_nist(t) = w_nist_max · min(1.0, t / t_warmup)
 t_warmup = 20 epochs
-w_nist_max = 1.0
+w_nist_max = 0.3        # 起步保守；不得默认 1.0
 ```
 
-PDE 权重 **不降**，让模型在 fine-tune 时仍受物理约束。
+PDE / action / node 权重 **不降**，让模型在 calibration 时仍受物理约束。
 
 ### 3.2 哪些参数 trainable / frozen
 
@@ -203,7 +253,7 @@ def setup_stage2(model, cfg):
     # add residual head
     model.residual_head = LevelResidualHead(
         d_cond=cfg.encoder.d_cond,
-        delta_max=cfg.stage2.delta_max,        # 50 meV → 1.84e-3 Ha
+        delta_max=cfg.stage2.delta_max,        # Phase 1: 1-5 meV; light atoms: 20 meV
     )
     
     optimizer = AdamW(
@@ -220,12 +270,12 @@ def setup_stage2(model, cfg):
 class LevelResidualHead(nn.Module):
     """Bounded learnable residual for term-dependent fine structure.
     
-    Δ = delta_max * tanh(MLP(h_cond, J_emb, parity_emb, term_emb))
+    Δ = delta_max * tanh(MLP(h_cond, J_emb, parity_emb, term_features))
     """
     
-    def __init__(self, d_cond: int, delta_max: float = 1.84e-3) -> None:
+    def __init__(self, d_cond: int, delta_max: float = 1.84e-4) -> None:
         super().__init__()
-        self.delta_max = float(delta_max)   # 50 meV → ≈ 1.84 mHa
+        self.delta_max = float(delta_max)   # default ≈ 5 meV; do not default to 50 meV
         self.mlp = nn.Sequential(
             nn.Linear(d_cond, 64),
             nn.SiLU(),
@@ -238,11 +288,23 @@ class LevelResidualHead(nn.Module):
         return self.delta_max * torch.tanh(self.mlp(h_cond).squeeze(-1))
 ```
 
-注意 V2 的 `delta_max` 比 V1 的 `delta_scale=0.1 Ha` 小 **54 倍**。原因：
+注意 V2 的 `delta_max` 必须比 V1 的 `delta_scale=0.1 Ha` 小很多。建议分档：
+
+| 场景 | `delta_max` |
+|------|-------------|
+| hydrogenic Phase 1 | 1-5 meV |
+| light atoms calibration | 20 meV |
+| heavy atoms ablation only | 50-100 meV，必须单独标注，不得作为主结果 |
 
 - V1 `delta_scale=0.1 Ha` 可以吃掉整个 H 1s 的 100 meV 误差（→ cheating）；
-- V2 期望 Stage 1 已经把波函数练对到 < 1 meV，**Δ_residual 只是补 term-dependent
-  多重态结构**，这通常 ≤ 50 meV（轻原子量级）。
+- V2 期望 Stage 1 已经把波函数练对到 < 1 meV，**Δ_residual 只用于残差校准**；
+- 若 `Δ_residual` 成为误差降低的主要来源，则不是成功，而是新的 cheating。
+
+禁止事项：
+
+- 禁止 `zn_bias_table`；
+- 禁止直接 `(Z, n)` lookup；
+- 避免让原始 `term_id` 变成纯查表记忆。优先使用结构化 term features，如 `(J, parity, spin multiplicity, L, jj tags)`。
 
 ### 3.4 训练循环（Stage 2）
 
@@ -252,6 +314,7 @@ def train_stage2(model, train_loader, hydrogenic_loader, val_loader, n_epochs, c
         "pde": DiracPDELoss(),
         "ortho": OrthonormalityLoss(),
         "node": NodeCountLoss(),
+        "action": BohrSommerfeldActionLoss(),
         "asym": AsymptoticTailLoss(),
         "smooth": BSplineSmoothLoss(),
         "nist": NISTScalarHuberLoss(delta=cfg.losses.nist_huber_delta,
@@ -275,6 +338,7 @@ def train_stage2(model, train_loader, hydrogenic_loader, val_loader, n_epochs, c
             L = (w_pde   * losses["pde"](...)
                + w_ortho * losses["ortho"](...)
                + w_node  * losses["node"](...)
+               + w_action* losses["action"](...)
                + w_asym  * losses["asym"](...)
                + w_smooth* losses["smooth"](out["c_raw"], batch["orb_mask"])
                + w_nist  * losses["nist"](E_pred, batch["E_target"],
@@ -297,6 +361,7 @@ def train_stage2(model, train_loader, hydrogenic_loader, val_loader, n_epochs, c
         
         # ── log
         val_metrics = validate(model, val_loader)
+        # validate 必须同时返回 E_orb-only 与 calibrated 两套指标。
         log_metrics(val_metrics)
 ```
 
@@ -305,11 +370,26 @@ def train_stage2(model, train_loader, hydrogenic_loader, val_loader, n_epochs, c
 ```yaml
 stage2:
   pass:
-    rms_meV: 50         # 全数据集（带 Δ_res 后）
+    e_orb_only_rms_meV: 50      # 主指标；不达标则 Stage 2 不算成功
+    calibrated_rms_meV: 20      # 次指标
     median_meV: 20
+    delta_abs_max_meV: 20       # Phase 1/light atoms 默认
+    delta_ratio_median: 0.2     # median |Δ| / median |E_orb - E_target|
+    loo_rms_meV: 200
     cos_threshold: 0.99 # 不允许波函数退化
     lambda_drift: 0.05
 ```
+
+### 3.6 `Δ_residual` 判定为 cheating 的条件
+
+任一条件成立，Stage 2 结果不得作为有效 V2 性能：
+
+- `E_orb-only` 误差仍大，而 calibrated 误差很小；
+- `median |Δ_residual| > 0.2 × median |E_orb - E_target|`；
+- `max |Δ_residual|` 接近 cap；
+- leave-one-n / leave-one-Z / leave-one-ion 中 calibrated 指标崩溃；
+- Stage 2 后 `|cos|`, `λ drift`, `L_PDE`, `L_action_BS` 任意门禁退化；
+- `Δ_residual` 的输入或参数形式等价于 `(Z, n)` 查表。
 
 ## 4. **关于 PDE 与 NIST 关系的严格论证**
 
@@ -333,21 +413,22 @@ Stage 1:  NIST → 不进 backward          (信息单向：仅监控)
           
 解析对照门禁:  λ 一致 + |cos| > 0.99 + E_orb 误差 < 1 meV  (硬约束)
           
-Stage 2:  NIST → 只能通过 Δ_residual head 流回梯度       (容量 ±50 meV)
+Stage 2:  NIST → 只能通过 Δ_residual head 流回梯度       (默认容量 1-20 meV)
           KAN main → 冻结或 lr=1e-6                       (波函数被锁定)
-          PDE  → 仍参与 backward                         (防止滑回)
+          PDE/action/node → 仍参与 backward               (防止滑回)
           
 每 epoch 物理回滚:  门禁违反 → 回到上一个通过 ckpt + 降低 w_nist_max
 ```
 
-⇒ **NIST 在 V2 中的全部权力被压在 50 meV 的 Δ_residual 上**；剩下的物理由 PDE 严格规约。
+⇒ **NIST 在 V2 中的全部权力被压在窄带 Δ_residual 上**；剩下的物理由 PDE + action + node 严格规约。
+更重要的是，`E_orb-only` 永远是主结果，`Δ_residual` 只是 calibration。
 
 ### 4.3 为什么这样能解 V1 没解开的问题
 
 | V1 失败原因 | V2 对应措施 |
 |-------------|-------------|
 | NIST 梯度主导，PDE 让步 | Stage 1 NIST 不接梯度，物理优先 |
-| Δ_term 吸收 ~50-100 meV → 假能量 | Stage 2 Δ_residual 严格 ≤ 50 meV，必要时设 ≤ 20 meV |
+| Δ_term 吸收 ~50-100 meV → 假能量 | 主结果只看 `E_orb-only`；Stage 2 Δ_residual 默认 1-20 meV 且要过 OOD |
 | λ 漂离 Z/n → 形状错 | KAN 显式吃 (Z, n)，门禁要求 `|λ−Z/n|/(Z/n) < 5%` |
 | RC 假设类不含 Laguerre → cos < 0.1 for n≥3 | B-spline 在 32 节点下可表 Laguerre 至 |cos|≈1 |
 | Löwdin renorm 把形状错误归一化掩盖 | 解析对照门禁直接对 P_model 与 P_analytic 求 cos |
@@ -357,8 +438,8 @@ Stage 2:  NIST → 只能通过 Δ_residual head 流回梯度       (容量 ±50
 
 V2 是否真的需要 Stage 2？
 
-**如果你的目标是"复现 NIST 数据"**：必要，因为单粒子 Dirac 方程不含多电子相关，
-PDE 收敛点必然偏离 NIST level（multi-electron correlation gap）。
+**如果你的目标是"复现 NIST 数据"**：Stage 2 可作为受限校准实验，因为单粒子 Dirac 方程不含多电子相关，
+PDE 收敛点必然偏离 NIST level（multi-electron correlation gap）。但它不能替代 `E_orb-only` 主基准。
 
 **如果你的目标是"做正确的单粒子量子力学"**：Stage 1 就够，Stage 2 可跳过。
 NIST 仅作为 final evaluation。
@@ -369,6 +450,14 @@ V2 配置文件提供两个 mode：
 # configs/v2_phase1_pde_only.yaml      # 仅 Stage 1
 # configs/v2_phase1_full.yaml          # Stage 1 + Stage 2
 ```
+
+### 4.5 推荐版本命名
+
+| 版本 | 含义 | 可作为主结果？ |
+|------|------|----------------|
+| `V2.0-physics` | Stage 1 only；PDE/action/node/ortho/asym/smooth；NIST 只评估 | **是** |
+| `V2.1-calibrated` | 在 V2.0 通过门禁后加窄带 `Δ_residual` | 否，只能作为次指标 |
+| `V2.x-ablation` | 放宽 residual 或解冻 KAN | 否，只能解释机制 |
 
 ## 5. 训练时间预估
 
@@ -387,7 +476,10 @@ V2 配置文件提供两个 mode：
 metrics.csv            # 所有 batch-level loss 与梯度范数
 gate.csv               # 每 epoch 的解析对照结果（|cos|, ΔE, λ_drift）
 lambda_drift.png       # 每个 (Z, n) 的 λ 漂移
-nist_residual.png      # NIST_pred - NIST_target 的箱型图
+action_quantization.png # ∫p_rdr - π(n-l-1/2) 的分布
+e_orb_only_residual.png # E_orb_sum - E_target 的箱型图（主）
+delta_residual.png      # Δ_residual 幅度与占比（如果启用）
+nist_calibrated.png     # E_orb_sum + Δ_residual - E_target（次）
 cos_per_n.png          # |cos(P_model, P_analytic)| 随 epoch 的轨迹
 stage_transition.txt   # 进入 Stage 2 的时间戳与状态
 ```
@@ -396,6 +488,8 @@ stage_transition.txt   # 进入 Stage 2 的时间戳与状态
 描述：
 - 通过 / 未通过门禁
 - 波函数形状偏离最大的行
+- `E_orb-only` 与 calibrated 的分离指标
+- residual 幅度、占比、OOD/LOO
 - 与 V1 R9 / B16 / B9-LOO 的对比表
 
 ## 7. 与 V1 LevelwiseTrainer 的关系

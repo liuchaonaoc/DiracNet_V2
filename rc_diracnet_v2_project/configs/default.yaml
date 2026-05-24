@@ -1,0 +1,264 @@
+seed: 42
+device: cuda
+
+grid:
+  r_min: 1.0e-4
+  r_max: 50.0
+  n_grid: 256
+  scheme: loglinear
+
+encoder:
+  d_embed_z: 32
+  d_embed_shell: 16
+  d_gru_hidden: 64
+  d_cond: 128
+  max_z: 110
+  max_n: 30
+  max_l: 7
+  max_seq: 32
+  term_vocab_size: 256
+
+bspline:
+  n_basis: 20
+  order: 3
+  knot_scheme: loglinear
+  force_c0_zero: true
+
+kan:
+  kind: mlp
+  hidden: 64
+  grid_size: 5
+  spline_order: 3
+
+envelope:
+  use_relativistic_gamma: false
+  lambda_min: 0.05
+  lambda_max: 20.0
+  # ADR-022: tightened 0.2 → 0.05 to remove the "disguise window" that let
+  # ψ_pred(n) collapse onto ψ_an(n-1, l) by drifting λ ~20% off Z/n. With
+  # exp(±0.05) ≈ [0.951, 1.051] the envelope decay rate is pinned to <5%
+  # of Z/n, forcing any wrong-n shape supervision (handled separately by
+  # L_anti_collapse, ADR-021) to fight a structurally wrong envelope.
+  lam_log_res_clamp: 0.05
+  freeze_lambda_residual: false
+
+readout:
+  n_orb_max: 16
+  q_residual_scale: 0.0
+
+stage1:
+  n_epochs: 1000
+  # ──────────────────────────────────────────────────────────────────────
+  # Loss-redesign §15 slice 1 (loss recomposition only)
+  # See prompts/15_loss_redesign_global_constraints.md
+  # and prompts/16_loss_redesign_rollout_plan.md
+  # Three local shape-supervision losses are DEPRECATED (weight = 0):
+  #   node_pos, node_cross, sign   (kept in code as monitors, see ADR-019)
+  # Global integral constraints take over:
+  #   action (Bohr-Sommerfeld) and node (smoothed node count)
+  # Other weights restored to the R1 baseline (c_norm=1.0, smooth=0.2)
+  # to isolate the "loss recomposition" effect from previous R3/R4 attempts.
+  # ──────────────────────────────────────────────────────────────────────
+  weights:
+    # ADR-017 + ADR-025: pde / decay_consistency / virial are now divided
+    # per-(B, N_orb) by E_char² inside their forward. 3-epoch smoke after
+    # enabling the normalisation showed all three losses got uniformly
+    # amplified by ratio (norm/raw) ≈ 11.7 (geometric mean of 1/E_char²
+    # across the hydrogenic 12-row set). Old weights would push
+    # decay × 10 = 564 to dominate the total. The three weights are
+    # rescaled by ~ 1/11.7 so the per-loss backward magnitude
+    # tracks the R3 baseline (pde≈0.83, decay≈0.21, virial≈0.05).
+    pde: 0.1                  # R3 was 1.0; rescaled per ADR-025 (ratio 11.8)
+    ortho: 10000.0
+    node: 0.5                 # opened (was 0.0); smoothed node count is a global integer
+    node_pos: 0.0             # DEPRECATED (§15 §2.1.A, ADR-019)
+    node_cross: 0.0           # DEPRECATED
+    sign: 0.0                 # DEPRECATED
+    lobe_ratio: 5.0           # demoted from 15.0; kept as auxiliary integral signal
+    action: 0.5               # opened (was 0.0); Bohr-Sommerfeld global action
+    lambda_prior: 300.0       # external Z/n anchor; unchanged
+    # ADR-027 (R5) — Shape weight bump 2.0 → 5.0. The ADR-017 + R3
+    # baseline converged to avg_shape ≈ 0.47 (cos²(P_pred, ψ_an_target)
+    # only ≈ 0.53), which is too soft an anchor: the Rayleigh quotient
+    # was free to drift P toward neighbouring n' shapes (collapse at
+    # R3, bloom under ADR-017). After ADR-026 (symmetric upper window)
+    # was Rejected for creating a "no-penalty basin → drift to lower-n"
+    # pathology, the next-cheapest attack is to make the *attractive*
+    # term stronger so it directly out-pulls Rayleigh-driven drift,
+    # without adding any new repulsive surface. Must move in lock-step
+    # with stage1_warmup.shape_weight_after_pretrain (same field used
+    # post-pretrain). See ADR-027 for analysis + re-tune protocol.
+    shape: 5.0
+    asym: 0.01
+    smooth: 0.2               # R1 baseline (R3/R4 had 0.05 which destabilised shallow states)
+    factor_amp: 3.0
+    c_norm: 1.0               # R1 baseline (R3/R4 had 0.3 which destabilised shallow states)
+    decay_consistency: 1.0    # R3 was 10.0; rescaled per ADR-025 (ratio 11.8)
+    virial: 0.1               # R3 was 1.0; rescaled per ADR-025 (ratio 11.6)
+    # ADR-021 + ADR-024 (after ADR-023 hinge regression):
+    #   L = (1/N_active)·Σ_orb Σ_{n'<n} cos²(ψ_pred, ψ_an(n', l))
+    # i.e. plain-sum form (τ=0 in stage1.anti_collapse below).
+    # Weight bumped 3 → 5 (F3) is RETAINED — the hinge form was the
+    # part that regressed (ADR-024), not the higher weight. The
+    # 1000-epoch ADR-021 run with weight=3 reached MAE ≈ 1054 meV;
+    # weight=5 with plain-sum is expected to reach ≈ 800-1000 meV
+    # based on the linear-in-weight scaling observed in earlier
+    # sensitivity sweeps (extrapolation, not yet validated end-to-end).
+    anti_collapse: 5.0
+  warmup:
+    node_start_epoch: 10
+    node_weight_after_warmup: 0.5         # match weights.node (was 0.2)
+    shape_pretrain_epochs: 60
+    pde_weight_during_shape_pretrain: 0.0
+    shape_weight_after_pretrain: 5.0      # ADR-027 — must equal weights.shape (was 2.0; bumped together)
+    # Action warmup (epoch-based linear ramp). Replaces the previous
+    # PDE-threshold gate (action_pde_threshold) which never fired post-detach.
+    action_warmup_start_epoch: 30
+    action_warmup_end_epoch: 100
+    action_weight_after_warmup: 0.5       # full action weight (was 0.05)
+    # Legacy fields kept for backwards compatibility; ignored when the
+    # action_warmup_* fields above exist.
+    action_start_epoch: 10
+    action_pde_threshold: 1.0e-1
+  gate:
+    cos_threshold: 0.99
+    e_orb_meV_threshold: 1.0
+    lambda_rel_threshold: 0.05
+    L_PDE_threshold: 1.0e-3
+    L_action_BS_threshold: 1.0e-3
+    test_manifest: data_cache/manifest_hydrogenic_v2.parquet
+  ortho:
+    # ADR-020: full Löwdin (eigh-based) is DISABLED as a routine path.
+    # The eigh backward is undefined when the overlap matrix has
+    # near-degenerate eigenvalues — that situation is the rule, not the
+    # exception, in early training and produced NaN gradients at epoch
+    # 201 of the slice-1-patch run. Until eigh is replaced by a
+    # Cholesky-based whitening (with a documented λ_min(S) gate and
+    # unit tests), this sentinel must remain ≥ 1_000_000.
+    use_full_lowdin_after_epoch: 1000000000
+  anti_collapse:
+    # ADR-024 (supersedes ADR-023): the hinge τ=0.02 form was tested in a
+    # full 1000-epoch run and produced a paradoxical regression — the
+    # hinge succeeded at its own objective (avg_anti_collapse 0.49 → 0.19,
+    # −62%) but MAE WORSENED from 1054 → 1201 meV (+14%). Diagnosis:
+    # zero gradient below τ frees c_raw to wiggle (avg_smooth +35%,
+    # avg_pde 1.08 → 1.15), shifting the Rayleigh quotient. Reverted
+    # to τ=0 (= ADR-021 plain-sum) but kept the higher weight=5 (F3).
+    # Future hinge re-trial must be coupled with bumped smooth/c_norm to
+    # contain the c_raw leakage; see ADR-024 for the protocol.
+    threshold: 0.0
+    # ADR-028 — Rejected (empirical regression, third anti_collapse
+    # iteration to hit the same failure pattern after ADR-023 hinge
+    # and ADR-026 symmetric plain-sum). The lookahead=1 +
+    # threshold_upper=0.30 asymmetric hinge form was deployed on top
+    # of ADR-027 in a full 1000-epoch run and produced:
+    #   MAE 934 → 1252 meV (+34 %, NO-GO gate triggered)
+    #   mean_signed −224 → −441 meV (−29 % worse)
+    #   (Z=3, n=2) residual +4185 → +4835 meV (the very level ADR-028
+    #     was designed to fix moved in the WRONG direction by +650 meV;
+    #     ADR-028 protocol said >+4000 = revert)
+    #   (2,2) collapse deepened −1804 → −2472 (+37 % deeper)
+    #   (3,3) collapse deepened −902 → −2302 (+154 % deeper)
+    #
+    # Mechanism (post-mortem, also captured in ADR-028 §Rejection):
+    # The "clean state silent" assumption that justified τ_upper=0.30
+    # held in smoke (3-epoch random init) but failed in 1000-epoch
+    # training. Mid-training c_raw noise repeatedly drove
+    # cos²(P, ψ_an(n+1)) above 0.30 on non-bloom samples ((2,2), (2,3),
+    # (3,3) shapes are *adjacent* to their (n+1) shapes in B-spline
+    # space). Each such trigger was an ADR-026 mini-episode that
+    # pushed P toward the lower-n Rayleigh basin. avg_anti_collapse
+    # fell 0.44 → 0.34 (hinge firing more than expected); MAE rose.
+    #
+    # Code support for `n_bloom_lookahead` and `threshold_upper` is
+    # retained — both are now provably-zero-effect when lookahead=0
+    # and the field stays in the YAML for self-documentation.
+    # **Do not re-enable lookahead > 0 in any form.** The
+    # anti_collapse loss has now been shown (ADR-023, ADR-026,
+    # ADR-028 = three independent failures) to be at its design
+    # limit; further bloom defence work should attack a different
+    # axis (curriculum / λ_prior single-sample / shape weight bump
+    # extension), not this loss's topology.
+    n_bloom_lookahead: 0
+    # `threshold_upper: null` is the only safe setting while
+    # n_bloom_lookahead = 0 (it has no effect either way, but the
+    # explicit null + invariant test enforce that no future YAML edit
+    # accidentally combines lookahead > 0 with this still set).
+    threshold_upper: null
+  # ─── ADR-018: n-curriculum (sub-stages 1a/1b/1c/1d) — Rejected ───────
+  # ADR-018 — Rejected after 1000-epoch regression on top of ADR-027.
+  # Hard-mask curriculum (fraction-based 1a/1b/1c/1d) was deployed with
+  # enabled: true and produced:
+  #   MAE 934 → 1298 meV (+39 %, NO-GO gate triggered)
+  #   mean_signed −224 → −1297 meV (|ratio|/MAE 0.24 → ~1.0, full collapse)
+  #   (Z=3, n=2) +4185 bloom → −7329 collapse (11514 meV swing)
+  #   (2,2) −1804 → −3071 (+70 % deeper collapse)
+  #   epoch 201 (1a→1b): avg_total 1.3 → 23.4 (×18 cliff, gate was ≤2×)
+  #
+  # Mechanism (post-mortem, ADR-018 §Rejection in design_rationale.md):
+  # 1a (200 epoch, n_max=1) ran with shape=0 and anti_collapse=0 — n=1
+  # has no lower-n′ and no radial nodes, so the two main wrong-n defences
+  # were silent for 20 % of training. KAN received almost no shape signal.
+  # Hard switch to 1b flooded the optimizer with n≥2 gradients the model
+  # had never backward-adapted to → Rayleigh drift to lower-n basin.
+  #
+  # Code path retained (_curriculum_state, mask in _physics_losses) for
+  # future A/B. **Do not set enabled: true** without a new ADR that
+  # fixes the 1a starvation (e.g. partial mask: keep shape/anti_collapse
+  # on all n, mask only pde/decay/virial) or implements soft curriculum.
+  curriculum:
+    enabled: false
+    # Schedule kept for self-documentation + unit tests (schema valid
+    # when re-enabled in an ablation). Invariant: enabled must be false
+    # in the default config until a new ADR re-justifies curriculum.
+    schedule:
+      - { name: "1a", fraction: 0.20, n_max_active: 1 }
+      - { name: "1b", fraction: 0.25, n_max_active: 2 }
+      - { name: "1c", fraction: 0.30, n_max_active: 3 }
+      - { name: "1d", fraction: 0.25, n_max_active: 99 }
+    lambda_prior_boost: 2.0
+    lambda_prior_boost_decay_frac: 0.333
+
+stage2:
+  enabled: false
+  n_epochs: 60
+  delta_max_meV: 5.0
+  w_nist_max: 0.3
+  warmup_epochs: 20
+  freeze_kan_main: true
+  residual_ratio_threshold: 0.2
+  require_ood_pass: true
+
+losses:
+  nist_huber_delta: 1.0e-3
+  align_ground: false
+  balancer: manual
+
+optimizer:
+  name: adamw
+  lr_kan: 1.0e-4
+  lr_encoder: 1.0e-4
+  lr_residual: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 5.0
+
+scheduler:
+  name: constant
+  warmup_steps: 30
+  total_steps: 900
+  min_lr_ratio: 0.1
+
+training:
+  batch_size: 4
+  val_every: 1
+  ckpt_dir: ./checkpoints/v2_default
+  log_dir: ./logs/v2_default
+
+dataset:
+  manifest: data_cache/manifest_hydrogenic_v2.parquet
+  max_orb: 16
+  max_seq: 32
+  group_by_ion: true
+  val_ion_holdout: true
+  val_holdout_per_ion: 2
+  align_in_loader: false

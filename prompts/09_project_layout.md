@@ -18,7 +18,9 @@ DiracNet_V2/
 │   ├── 09_project_layout.md         (本文件)
 │   ├── 10_sprint_plan.md
 │   ├── 11_test_plan.md
-│   └── 12_port_from_v1.md
+│   ├── 12_port_from_v1.md
+│   ├── 13_action_and_residual_safety.md
+│   └── 14_code_structure_generation.md
 ├── docs/
 │   └── design_rationale.md
 └── rc_diracnet_v2_project/          # 实际代码项目（按 prompts/10 顺序生成）
@@ -128,6 +130,7 @@ losses/
 ├── orthonormality_loss.py    # copy
 ├── nist_scalar_loss.py       # copy
 ├── node_count_loss.py        # NEW
+├── action_loss.py            # NEW: Bohr-Sommerfeld action quantisation
 ├── asymptotic_loss.py        # NEW
 ├── bspline_smooth_loss.py    # NEW
 └── loss_balancer.py          # copy (for compatibility)
@@ -238,7 +241,8 @@ stage1:
   weights:
     pde: 10.0
     ortho: 1.0
-    node: 0.1
+    node: 0.0                 # warmup 后开到 0.1
+    action: 0.0               # L_PDE 稳定后开到 0.05
     asym: 0.01
     smooth: 1.0e-4
   gate:
@@ -246,15 +250,19 @@ stage1:
     e_orb_meV_threshold: 1.0
     lambda_rel_threshold: 0.05
     L_PDE_threshold: 1.0e-3
+    L_action_BS_threshold: 1.0e-3
     test_manifest: data_cache/manifest_hydrogenic_v2.parquet
   
 stage2:
   n_epochs: 50
-  delta_max_meV: 50.0
+  enabled: false              # 默认只做 V2.0-physics；calibration 显式开启
+  delta_max_meV: 5.0          # Phase 1 默认 1-5 meV；light atoms 可设 20 meV
   warmup_epochs: 20
-  w_nist_max: 1.0
+  w_nist_max: 0.3
   freeze_kan_main: true
   reduce_w_nist_on_rollback: 0.5
+  residual_ratio_threshold: 0.2
+  require_ood_pass: true
 
 losses:
   nist_huber_delta: 1.0e-3       # δ in Hartree (~27 meV)
@@ -319,6 +327,7 @@ tests/
 ├── test_v2_kinetic_balance.py
 ├── test_v2_kan_coeff_net.py
 ├── test_v2_node_count_loss.py
+├── test_v2_action_loss.py
 ├── test_v2_asymptotic_loss.py
 ├── test_v2_smooth_loss.py
 ├── test_v2_pde_loss.py                    # 复用 V1 test
@@ -328,6 +337,7 @@ tests/
 ├── test_v2_gate_pass_on_analytic.py       # 解析输入下门禁直接 PASS
 ├── test_v2_gate_fail_on_random.py
 ├── test_v2_two_stage_trainer_smoke.py     # 3 epoch smoke
+├── test_v2_residual_safety.py             # Δ_residual anti-cheating
 └── test_v2_full_smoke.py                  # 端到端冒烟
 ```
 

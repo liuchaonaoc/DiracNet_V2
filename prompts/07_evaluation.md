@@ -8,7 +8,7 @@
 | 层级 | 工具 | 频率 | 失败后果 |
 |------|------|------|----------|
 | **A. 解析对照门禁** | `scripts/v2_gate_analytic.py` | 每 epoch | 决定能否进入 Stage 2；回滚 Stage 2 |
-| **B. 能量准确度** | `scripts/v2_evaluate.py` | Stage 末 | 决定模型是否合格发布 |
+| **B. 能量准确度** | `scripts/v2_evaluate.py` | Stage 末 | 同时报告 `E_orb-only` 与 calibrated；只以前者作为主结果 |
 | **C. KAN 可视化 / 诊断** | `scripts/v2_visualize.py` | 选做 | 解释训练动态 |
 
 ## 2. A — 解析对照门禁
@@ -87,6 +87,7 @@ Stage 1 / Stage 2 物理对照门禁。
   |cos| > 0.99  for all rows
   |ΔE| < 1 meV  for all rows
   |λ_pred − Z/n| / (Z/n) < 5%
+  |∫p_rdr − π(n-l-1/2)| < action_threshold
 """
 ```
 
@@ -121,6 +122,7 @@ Aggregate:
   Δλ_max  = 0.41%      (threshold 5%)     ✓
   ΔE_max  = 0.42 meV   (threshold 1 meV)  ✓
   L_PDE   = 7.4e-4     (threshold 1e-3)   ✓
+  L_action_BS = 3.1e-5 (threshold 1e-3)   ✓
 
 VERDICT: PASS
 ```
@@ -136,7 +138,7 @@ python scripts/v2_evaluate.py \
     --out results/v2_phase1/eval.txt
 ```
 
-输出：
+输出必须把 `E_orb-only` 放在 calibrated 之前：
 
 ```
 === Stage 2 Evaluation ===
@@ -144,15 +146,35 @@ checkpoint: ...
 manifest:   ...
 levels:     15
 
+=== E_orb-only (MAIN RESULT; no Δ_residual) ===
 without ground alignment:
-  RMS  |error| = 12.4 meV
-  MAE  |error| = 8.3 meV
+  RMS  |error| = 18.0 meV
+  MAE  |error| = 12.0 meV
 
 with align_ground=True:
+  RMS  |error| = 14.0 meV
+  MAE  |error| = 9.0 meV
+  median |error| = 6.0 meV
+  max  |error| = 42.0 meV
+
+=== E_orb + Δ_residual (CALIBRATION ONLY) ===
+without ground alignment:
   RMS  |error| = 7.1 meV
   MAE  |error| = 4.5 meV
-  median |error| = 3.0 meV
-  max  |error| = 23.0 meV
+
+with align_ground=True:
+  RMS  |error| = 5.2 meV
+  MAE  |error| = 3.4 meV
+  median |error| = 2.0 meV
+  max  |error| = 18.0 meV
+
+=== Δ_residual Safety ===
+  max |Δ_residual| = 4.8 meV  (cap 5.0 meV)    ✓
+  median |Δ_residual| = 1.1 meV
+  median |Δ| / median |E_orb - E_target| = 0.12 (threshold 0.20) ✓
+  leave-one-n RMS = 41.0 meV                  ✓
+  leave-one-Z RMS = 55.0 meV                  ✓
+  leave-one-ion RMS = 60.0 meV                ✓
 
 per (Z, ion_charge) — MAE & RMS (meV):
   Z=1 ion=0: n=5 MAE=4.5  RMS=7.1
@@ -169,10 +191,13 @@ Z=3 ion=2:       30.0       |  5.0        | -25.0 meV
 cos_min: 0.9988  (threshold 0.99)  ✓
 Δλ_max:  1.2%   (threshold 5%)     ✓
 ΔE_orb_max (without Δ_res): 1.5 meV (threshold 5 meV)  ✓
-Δ_res_max: 32 meV  (cap 50 meV)    ✓
+L_action_BS: 8.0e-4 (threshold 1e-3) ✓
+Δ_res_max: 4.8 meV  (cap 5 meV)     ✓
 
 VERDICT: ACCEPT
 ```
+
+如果 `E_orb-only` 不达标，但 calibrated 达标，VERDICT 必须是 `CALIBRATION-ONLY / NOT PHYSICS PASS`。
 
 ## 4. C — KAN 可视化与诊断
 
@@ -221,15 +246,30 @@ python scripts/v2_plot_training.py \
 任何论文 / 报告中提到 V2 性能数字时，**必须** 附带：
 
 ```
-[V2 Phase 1 Stage 1+2]
-- RMS = X meV (aligned), Y meV (raw)
+[V2 Phase 1]
+- E_orb-only RMS = X meV (aligned), Y meV (raw)   ← 主结果
+- E_orb+Δ RMS = X2 meV (aligned), Y2 meV (raw)    ← 次结果，若启用
 - |cos| min = Z   (must be > 0.99 if claimed)
 - λ drift max = W%   (must be < 5%)
-- Δ_residual max = D meV   (must be < 50 meV)
+- L_action_BS = A   (must be < threshold)
+- Δ_residual max = D meV
+- median |Δ| / median |E_orb - E_target| = R (must be < 0.2)
 - LOO RMS = L meV (if measured)
+- leave-one-n / leave-one-Z / leave-one-ion OOD metrics
 ```
 
 少一项，结果作废。这是 V2 的承诺。
+
+### 5.1 `Δ_residual` 判定为 cheating 的规则
+
+下列任一发生，calibrated 结果不得作为 V2 成功：
+
+- `E_orb-only` 高误差，`E_orb+Δ` 低误差；
+- residual 幅度接近 cap；
+- residual 占比超过 20%；
+- LOO/OOD 崩溃；
+- Stage 2 后 `|cos|`, `λ`, `L_PDE`, `L_action_BS` 退化；
+- residual 输入或参数结构等价于 `(Z, n)` lookup。
 
 ## 6. 与 V1 evaluator 的对照
 
@@ -246,6 +286,8 @@ python scripts/v2_plot_training.py \
 - [ ] `test_hydrogenic_analytic_P` 通过：解析 1s 喂入 → `E_orb ≈ -0.5 Ha`
 - [ ] `test_gate_passes_on_analytic_init` 通过：初始（λ=Z/n, c=0）下门禁直接 PASS
 - [ ] `test_gate_fails_on_random_init` 通过：随机 c 下门禁 FAIL（验证门禁敏感性）
+- [ ] `test_action_loss_hydrogenic_quantization` 通过：解析 Coulomb 下 `L_action_BS ≈ 0`
 - [ ] `v2_gate_analytic.py` 在 stage1_passed.pt 上 PASS
-- [ ] `v2_evaluate.py` 在 stage2_best.pt 上 RMS < 50 meV
+- [ ] `v2_evaluate.py` 同时输出 `E_orb-only` 与 calibrated 指标，且主指标达标
+- [ ] residual safety 指标通过：`max |Δ|`, residual ratio, LOO/OOD
 - [ ] LOO 测试：hold out 5s/6s 不参与训练，eval RMS < 200 meV

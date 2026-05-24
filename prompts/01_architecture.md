@@ -102,8 +102,8 @@ E_orb    = orbital_energy_from_dirac(P, Q, LP, LQ, grid)       # Rayleigh quotie
 #────────────────────────────────────────────────────────
 # Stage 1:
 E_pred_stage1 = Σ_a occ_a · E_orb_a                            # [B]
-# Stage 2:
-Δ_res = LevelResidualHead(h_cond, J, π, term)                  # bounded ±50 meV [B]
+# Stage 2 (optional calibration only):
+Δ_res = LevelResidualHead(h_cond, J, π, term_features)         # bounded 1-5 meV in Phase 1 [B]
 E_pred_stage2 = E_pred_stage1 + Δ_res
 
 #────────────────────────────────────────────────────────
@@ -112,16 +112,22 @@ E_pred_stage2 = E_pred_stage1 + Δ_res
 L_PDE    = DiracPDELoss(P, Q, dPdr, dQdr, E_orb, V_eff, κ, r_grid, grid, orb_mask)
 L_ortho  = OrthonormalityLoss(P, Q, grid, orb_mask)
 L_node   = NodeCountLoss(P, n_required = n - l - 1, grid)
+L_action = BohrSommerfeldActionLoss(E_orb, V_eff, n, l, orb_mask, grid)
 L_asym   = AsymptoticTailLoss(P, λ, γ, r_grid)
 L_smooth = BSplineSmoothLoss(c)   # 二阶差分
 
 # Stage 1:
-loss = w_pde · L_PDE + w_ortho · L_ortho + w_node · L_node + w_asym · L_asym + w_smooth · L_smooth
+loss = w_pde · L_PDE + w_ortho · L_ortho + w_node · L_node
+     + w_action · L_action + w_asym · L_asym + w_smooth · L_smooth
 
-# Stage 2 (extra):
+# Stage 2 (optional calibration only):
 L_NIST = NISTScalarHuberLoss(E_pred_stage2, E_target, Z, charge)
 loss += w_nist · L_NIST
 ```
+
+`E_pred_stage1 = Σ occ · E_orb` 是 V2 主结果；`E_pred_stage2 = E_pred_stage1 + Δ_residual`
+只是 calibrated 次结果。任何 evaluator 必须同时报告两者，且 residual safety 不通过时
+不得把 Stage 2 数字称为物理成功。
 
 ## 3. 模块依赖图
 
@@ -161,7 +167,8 @@ loss += w_nist · L_NIST
               ┌──────────────────────┐
               │  Losses              │
               │  L_PDE / L_ortho /   │
-              │  L_node / L_asym /   │
+              │  L_node / L_action / │
+              │  L_asym /            │
               │  L_NIST (Stage 2)    │
               └──────────────────────┘
 ```
@@ -176,7 +183,7 @@ loss += w_nist · L_NIST
 | `f(r)` | 1 (constant) | Laguerre-like 多项式 |
 | `P(r)` | env(r) = r^γ exp(-λr) | r^γ exp(-λr) · L_{n-l-1}^{2l+1}(2λr) |
 | `Q(r)` | kinetic-balance(P) | 同左（≈相对论小分量） |
-| `Δ_res` | 0 (Stage 2 起步) | ≤ 50 meV |
+| `Δ_res` | 0 (Stage 2 起步) | Phase 1 ≤ 5 meV；light atoms ≤ 20 meV |
 | `E_orb` | ≈ `-Z²/(2n²)` from analytic init | true eigenvalue |
 | `L_PDE` (init) | ~1e0..1e1 | < 1e-3 (Stage 1 后) |
 | `L_NIST` (Stage 2 init) | depends | < 1e-4 |
@@ -203,7 +210,8 @@ optimizer_stage1 = AdamW(
 for epoch in range(N1):
     for batch in train_loader:
         out = model(batch, stage=1)
-        L = w_pde * L_PDE + w_ortho * L_ortho + w_node * L_node + w_asym * L_asym
+        L = (w_pde * L_PDE + w_ortho * L_ortho + w_node * L_node
+             + w_action * L_action + w_asym * L_asym + w_smooth * L_smooth)
         L.backward()
         optimizer_stage1.step()
     # log NIST as monitoring metric (no grad)
@@ -213,9 +221,9 @@ for epoch in range(N1):
         save_checkpoint("stage1_passed.pt")
         break
 
-# Stage 2: NIST-residual fine-tune
+# Stage 2: optional NIST-residual calibration
 freeze(kan_main_params)
-add(LevelResidualHead)  # bounded ±50 meV, zero-init
+add(LevelResidualHead)  # bounded 1-5 meV for Phase 1, zero-init
 optimizer_stage2 = AdamW(
     params=[*residual_head.params],
     lr=1e-4,
@@ -223,7 +231,8 @@ optimizer_stage2 = AdamW(
 for epoch in range(N2):
     for batch in train_loader:
         out = model(batch, stage=2)
-        L = w_pde * L_PDE + w_nist * L_NIST_residual
+        L = (w_pde * L_PDE + w_action * L_action + w_node * L_node
+             + w_nist * L_NIST_residual)
         L.backward()
         optimizer_stage2.step()
     if violates_gate(model, threshold=0.99):
